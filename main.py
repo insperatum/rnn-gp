@@ -65,18 +65,21 @@ parser.add_argument('--novelty', type=float, default=0.)
 parser.add_argument('--sgdIter', type=int, default=0)
 parser.add_argument('--evoIter', type=int, default=9999999)
 parser.add_argument('--sgdEvals', type=int, default=1)
-parser.add_argument('--evoEvals', type=int, default=10)
+parser.add_argument('--evoEvals', type=int, default=1)
 parser.add_argument('--verbose', dest='verbose', action='store_true')
 parser.add_argument('--meta', dest='meta', action='store_true')
 parser.add_argument('--deterministic', dest='deterministic', action='store_true')
 parser.add_argument('--normalise', dest='normalise', action='store_true')
 parser.add_argument('--variational', dest='variational', action='store_true')
+parser.add_argument('--baseline', dest='baseline', action='store_true')
 parser.add_argument('--sgdPrint', type=int, default=10)
 parser.add_argument('--evoPrint', type=int, default=1)
 parser.add_argument('--saveEvery', type=int, default=100)
 parser.add_argument('--selection', type=str, default="tournament()")
-parser.add_argument('--initial_softmax', type=float, default=10) #5
+parser.add_argument('--initial_softmax', type=float, default=10)
+ #5
 
+parser.set_defaults(baseline=False)
 parser.set_defaults(normalise=False)
 parser.set_defaults(variational=False)
 parser.set_defaults(verbose=False)
@@ -148,10 +151,10 @@ def newAgent():
 	genome = {
 		# 'z':[{'val':np.random.randn(opt.embeddingSize), 'resampleIfUnsolved':{'idx':i}, 'mutation_sd':0.1, 'pCrossover':0.5} for i in range(opt.nTargets)],
 		# 'z_logvar':[{'val':np.ones(opt.embeddingSize)*-1, 'mutation_sd':0.1, 'pCrossover':0.5} for i in range(opt.nTargets)]
-		
-		'log_lr':{'val':np.log(opt.lr), 'mutation_sd':0.1},
 		'decoder':{
 			'val':{
+				'p_uniform':{'val':1.} if opt.baseline else {'val':0.1, 'mutation_sd':0.01, 'min':0, 'max':1},
+				'argnoise_logsd':{'val':-1., 'mutation_sd':0.1},
 				'h':[squareParams() for i in range(opt.layers)],
 				'softmax_weight':{'val':np.random.randn(len(actions), opt.embeddingSize)  * opt.initial_softmax / np.sqrt(opt.embeddingSize), 'mutation_sd':0.1},
 				'const':{
@@ -164,6 +167,7 @@ def newAgent():
 			'pCrossover':0.5
 		}
 	}
+	if opt.sgdIter>0: genome['log_lr'] = {'val':np.log(opt.lr), 'mutation_sd':0.1}
 	for action in actions:
 		if 'nargs' in action:
 			genome['decoder']['val'][action['name']] = [squareParams() for _ in range(action['nargs'])]
@@ -193,10 +197,11 @@ def initialiseZ(agents):
 	for agent in agents:
 		agent['genome']['z']={
 			'val':[{'val':
-				{'seed': {'val':np.random.randint(np.iinfo(np.int32).max, size=opt.evoEvals), 'resampleIfUnsolved':{'idx':i, 'p':0.2, 'type':'integer'}},
-				'mu': {'val':np.random.randn(opt.embeddingSize), 'resampleIfUnsolved':{'idx':i, 'p':0.2, 'type':'gaussian'}, 'mutation_sd':0.1},
-				'logvar': {'val':np.ones(opt.embeddingSize)*-1, 'resetIfUnsolved':{'idx':i, 'val':np.ones(opt.embeddingSize)*-1}, 'mutation_sd':0.2}},
-				'pCrossover':0.5
+				{
+				'seed': {'val':np.random.randint(np.iinfo(np.int32).max, size=opt.evoEvals), 'resampleIfUnsolved':{'idx':i, 'p':0.2, 'type':'integer'}},
+				'mu': {'val':np.random.randn(opt.embeddingSize), 'resampleIfUnsolved':{'idx':i, 'p':0.2, 'type':'gaussian'}, 'mutation_sd':0.1}},
+				# 'logvar': {'val':np.ones(opt.embeddingSize)*-1, 'resetIfUnsolved':{'idx':i, 'val':np.ones(opt.embeddingSize)*-1}, 'mutation_sd':0.2}},
+			'pCrossover':0.5
 			} for i in range(opt.nTargets)]}
 
 		if opt.normalise: agent['genome']['z']['normalise'] = "mu"
@@ -210,10 +215,11 @@ def decode(genome, i, k): #i = program index, k = eval number
 		for i in range(opt.layers):
 			h = util.elu(linear(decoder['val']['h'][i], h))
 		logprobs = util.logsoftmax(np.dot(decoder['val']['softmax_weight']['val'], h))
-		
+		probs = np.exp(logprobs)
+		probs = decoder['val']['p_uniform']['val']*np.ones(len(probs))/len(probs) + (1-decoder['val']['p_uniform']['val'])*probs
 		if depth>=maxDepth:
 			possible_idxs = np.array([i for i in range(len(actions)) if actions[i]=="const" or ("nargs" in actions[i] and actions[i]["nargs"]==0)])
-			probs = np.exp(logprobs)[possible_idxs]
+			probs = probs[possible_idxs]
 			probs = probs / sum(probs)
 			if opt.deterministic:
 				action_idx = possible_idxs[np.argmax(getval(probs))]
@@ -229,7 +235,7 @@ def decode(genome, i, k): #i = program index, k = eval number
 				logq=0
 			else:
 				action_idx = prng.choice(np.arange(len(logprobs)), p=probs)
-				logq = logprobs[action_idx]
+				logq = np.log(probs[action_idx])
 		action = actions[action_idx]
 			
 		if action['name']=='const':
@@ -247,7 +253,7 @@ def decode(genome, i, k): #i = program index, k = eval number
 		# 	f = lambda x: d['f'](x)
 		# 	return {'f':f, 'logq':logq, 'name':name}
 		else:
-			zs = [linear(params, h) for params in decoder['val'][action['name']]]
+			zs = [linear(params, h) + prng.randn(opt.embeddingSize)*np.exp(decoder['val']['argnoise_logsd']['val']) for params in decoder['val'][action['name']]]
 			ds = [decodeInner(z, prng, depth+1) for z in zs]
 			args = [d['f'] for d in ds]
 			logqs = [d['logq'] for d in ds]
@@ -344,7 +350,7 @@ def getSummary(agent, name, stats=None, verbose=False):
 	# util.recurse(lambda x: collectMutate("decoder", x), genome["decoder"])
 	
 	if opt.meta:
-		string = string + "\n" + "Learning Rate:" + str(np.exp(agent["genome"]["log_lr"]['val']))
+		if opt.sgdIter>0: string = string + "\n" + "Learning Rate:" + str(np.exp(agent["genome"]["log_lr"]['val']))
 		# string = string + "\tz resampling:" + "%.3f"%np.min(resample_rates["z"]) + "-" + "%.3f"%np.max(resample_rates["z"])
 		# string = string + "\tdecoder mutation:" + "%.3f"%np.min(mutation_sd["decoder"]) + "-" + "%.3f"%np.max(mutation_sd["decoder"]) + "}" + "\n"
 	# if stats is not None:
@@ -353,7 +359,7 @@ def getSummary(agent, name, stats=None, verbose=False):
 	return string
 
 
-def tournament(alpha=1,sampleInner=False,select="multiple",proportion=0.5): # select in {"single","multiple"}
+def tournament(alpha=1,sampleInner=False,select="multiple",proportion=0.2): # select in {"single","multiple"}
 	if select=="single":
 		nPlayers = int(nAgents*proportion)
 	else:
@@ -429,7 +435,12 @@ def offspring():
 					if np.random.rand()<0.5: (xs[0]['val'], xs[1]['val']) = (xs[1]['val'], xs[0]['val'])
 				if 'mutation_sd' in x:
 					if opt.meta: x['mutation_sd'] *= np.exp(np.random.randn() * 0.1)
-					x['val'] += np.random.randn(*x['val'].shape)*x['mutation_sd']
+					if type(x['val'])==float:
+						x['val'] += np.random.randn()*x['mutation_sd']
+					else:
+						x['val'] += np.random.randn(*x['val'].shape)*x['mutation_sd']
+					if 'min' in x: x['val'] = np.maximum(x['val'], x['min'])
+					if 'max' in x: x['val'] = np.minimum(x['val'], x['max'])
 				if 'resampleIfUnsolved' in x:
 					progIdx = int(x['resampleIfUnsolved']['idx'])
 					if np.random.rand() > agents[0]["solved"][progIdx] and np.random.rand()<x['resampleIfUnsolved']['p']:
